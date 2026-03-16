@@ -77,7 +77,6 @@ def func_diff_corners(x, coes):
     r = r_lr + r_ll + r_ul + r_ur + +1e-1
     return r
 
-
 class GridEnv:
     def __init__(
         self, horizon, ndim=2, xrange=[-1, 1], func=None, allow_backward=False
@@ -290,6 +289,157 @@ class GridEnv:
         modes = [(x, r) for x, r in zip(states, rewards) if r > 1]
         return modes
 
+class MOGridEnv(GridEnv):
+    def __init__(self, horizon, ndim=2, xrange=[-1, 1], func=None, allow_backward=False, R0=1e-5, R1=0.5, R2=2.0):
+        # accept `func` and forward it to the base GridEnv
+        super().__init__(horizon, ndim, xrange, func=func, allow_backward=allow_backward)
+        self.R0 = R0
+        self.R1 = R1
+        self.R2 = R2
+        # reference point for Tchebycheff — updated as we find better values
+        self.z_star = np.array([0.0, 0.0])
+        self._current_weight = None
+        # cache for expensive full-enumeration results
+        self._pareto_modes = None
+        self._all_int_states = None
+
+    def mo_reward(self, x):
+        """
+        returns conflicting (f1, f2)
+        f1: rewards positive corner (all dims > 0.5)
+        f2: rewards negative corner (all dims < -0.5)
+        """
+        f1 = self.R0 + (x > 0.5).prod(-1) * self.R1 + \
+             ((x < 0.8) * (x > 0.6)).prod(-1) * self.R2
+        f2 = self.R0 + (x < -0.5).prod(-1) * self.R1 + \
+             ((x > -0.8) * (x < -0.6)).prod(-1) * self.R2
+        return np.array([f1, f2])
+
+    def scalarize(self, x, w):
+        """
+        Tchebycheff scalarization
+        w: weight vector of length 2, summing to 1
+        Returns a single scalar fitness value.
+        """
+        f = self.mo_reward(x)
+        
+        # print("Z_STAR: ", self.z_star, " MO_REWARD: ", f, " WEIGHTS: ", w, "SCALARIZED REWARD: ", np.max(w * np.abs(f - self.z_star)))
+        print(f"[scalarize] before_update z_star={self.z_star} f={f} w={w} scalar={np.max(np.array(w, dtype=float) * np.abs(f - self.z_star))}")
+        self.z_star = np.maximum(self.z_star, f)  # update reference point
+
+        
+
+        return np.max(w * np.abs(f - self.z_star))
+
+    def step_dag(self, a, s=None, w=None):
+        """
+        overrides parent step_dag to use scalarized reward at terminal state.
+        w: weight vector for this agent. If None, falls back to f1 only.
+        """
+
+        if w is None:
+            w = getattr(self, "_current_weight", None)
+
+        _s = s
+        s = (self._state if s is None else s) + 0
+        if a < self.ndim:
+            s[a] += 1
+        done = s.max() >= self.horizon - 1 or a == self.ndim
+        if _s is None:
+            self._state = s
+            self._step += 1
+
+        if done:
+            x = self.s2x(s)
+            if w is not None:
+                r = self.scalarize(x, w)
+            else:
+                r = self.mo_reward(x)[0]  # fallback to f1
+        else:
+            r = 0
+
+        return self.obs(s), r, done, s
+
+    def step(self, a, s=None, w=None):
+        if self.allow_backward:
+            return self.step_chain(a, s)
+        return self.step_dag(a, s, w=w)
+
+    def true_density_mo(self, w):
+        """
+        Computes true density under a specific weight vector w.
+        Used for evaluation — replaces true_density() for MO setting.
+        """
+        all_int_states = np.int32(
+            list(itertools.product(*[list(range(self.horizon))] * self.ndim))
+        )
+        state_mask = np.array(
+            [
+                len(self.parent_transitions(s, False)[0]) > 0 or sum(s) == 0
+                for s in all_int_states
+            ]
+        )
+        all_xs = (
+            np.float32(all_int_states)
+            / (self.horizon - 1)
+            * (self.xspace[-1] - self.xspace[0])
+            + self.xspace[0]
+        )
+        # Scalarized rewards under this weight vector
+        traj_rewards = np.array([
+            self.scalarize(x, w) for x in all_xs[state_mask]
+        ])
+        return (
+            traj_rewards / traj_rewards.sum(),
+            list(map(tuple, all_int_states[state_mask])),
+            traj_rewards,
+        )
+
+    def pareto_modes(self):
+        """
+        Returns all terminal states that are Pareto-optimal —
+        i.e. no other state dominates them on both objectives.
+        Used for evaluation instead of single-objective mode counting.
+        """
+        # Use cached value if available (full enumeration is expensive)
+        if getattr(self, "_pareto_modes", None) is not None:
+            return self._pareto_modes
+
+        # Cache all_int_states to avoid recomputing the huge grid repeatedly
+        if getattr(self, "_all_int_states", None) is None:
+            self._all_int_states = np.int32(
+                list(itertools.product(*[list(range(self.horizon))] * self.ndim))
+            )
+        all_int_states = self._all_int_states
+
+        state_mask = np.array(
+            [
+                len(self.parent_transitions(s, False)[0]) > 0 or sum(s) == 0
+                for s in all_int_states
+            ]
+        )
+        reachable = all_int_states[state_mask]
+        all_xs = (
+            np.float32(reachable)
+            / (self.horizon - 1)
+            * (self.xspace[-1] - self.xspace[0])
+            + self.xspace[0]
+        )
+        rewards = np.array([self.mo_reward(x) for x in all_xs])  # (N, 2)
+
+        # A state is Pareto-optimal if no other state dominates it on both objectives
+        pareto = []
+        for i, r_i in enumerate(rewards):
+            dominated = any(
+                np.all(rewards[j] >= r_i) and np.any(rewards[j] > r_i)
+                for j in range(len(rewards)) if j != i
+            )
+            if not dominated:
+                pareto.append(tuple(reachable[i]))
+
+        # cache result to avoid recomputing on every eval
+        self._pareto_modes = pareto
+        return pareto
 
 def make_mlp(l, act=nn.LeakyReLU(), tail=[]):
     """makes an MLP with no top layer activation"""
@@ -383,12 +533,35 @@ class ReplayBufferTB:
         self.bufsize = args.replay_buf_size
         self.env = env
 
+    '''
     def add(self, x, a, r_x):
         if self.strat == "top_k":
             if len(self.buf) < self.bufsize or r_x > self.buf[0][0]:
                 self.buf = sorted(self.buf + [(r_x, a, x)], key=lambda x: x[0])[
                     -self.bufsize :
                 ]
+    '''
+    def add(self, x, a, r_x, pref=None, producer=None):
+        """
+        Store a trajectory summary into the TB buffer.
+        - x: stacked states (T+1, ndim)
+        - a: actions (T, 1) or similar
+        - r_x: scalar terminal reward
+        - pref: optional preference/weight vector used to generate this trajectory (MO)
+        - producer: optional provenance tag (agent id / STAR/POP)
+        Stored entry format: (r_x, a, x, pref, producer) for future retrieval
+        """
+        entry = (r_x, a, x, None if pref is None else np.array(pref), producer)
+        if self.strat == "top_k":
+            if len(self.buf) < self.bufsize or r_x > self.buf[0][0]:
+                # keep top-k by reward (sort by first element)
+                self.buf = sorted(self.buf + [entry], key=lambda e: e[0])[-self.bufsize :]
+        else:
+            # simple FIFO / circular behavior: append and maybe trim
+            if len(self.buf) >= self.bufsize:
+                # drop oldest
+                self.buf.pop(0)
+            self.buf.append(entry)
 
     def sample(self):
         # this has to give us [state, action, reward] state.shape is (self.sample_size, traj_length, dim)
@@ -439,6 +612,47 @@ class ReplayBufferTB:
             done = False
             r = 0
         return traj
+    
+    def debug_print(self, n: int = 10):
+        """Print the first n raw entries in the TB replay buffer (compact)."""
+        print(f"ReplayBufferTB len={len(self.buf)}")
+        for i, entry in enumerate(self.buf[:n]):
+            # support (r,a,x) and extended (r,a,x,pref,producer)
+            try:
+                if len(entry) >= 5:
+                    r, a, x, pref, prod = entry
+                elif len(entry) == 4:
+                    r, a, x, pref = entry
+                    prod = None
+                elif len(entry) == 3:
+                    r, a, x = entry
+                    pref, prod = None, None
+                else:
+                    print(f"{i}: (unrecognized entry) {entry}")
+                    continue
+            except Exception:
+                print(f"{i}: (unrecognized entry) {entry}")
+                continue
+            a_shape = getattr(a, "shape", None)
+            x_shape = getattr(x, "shape", None)
+            try:
+                r_val = float(r)
+            except Exception:
+                r_val = r
+            print(f"{i}: reward={r_val:.6g}, pref={pref}, producer={prod}, action_shape={a_shape}, state_shape={x_shape}")
+            if i < 3:
+                def _preview(t):
+                    try:
+                        if hasattr(t, "detach"):
+                            return t.detach().cpu().numpy()
+                        return np.array(t)
+                    except Exception:
+                        return str(t)
+                try:
+                    print("   action preview:", _preview(a))
+                    print("   state preview: ", _preview(x))
+                except Exception:
+                    pass
 
 
 class ReplayBufferDB:
@@ -658,6 +872,396 @@ class RND(nn.Module):
         mean_rnd_loss = torch.mean(rnd_loss)
         return mean_rnd_loss
 
+class ConditionalTBFlowNetAgent:
+    """
+    Conditional TBFlowNetAgent: pi(a | s, w) where w is the preference weight vector
+    - On sampling: fresh rollouts are stored in replay with pref=self.weight_vector (may be None)
+    - When returning sampled data, we return an extra prefs list aligned with episodes
+      so learn_from can condition on the generating weight.
+    """
+    def __init__(self, args, envs, is_star=True, cond_dim: int = 2):
+        # input dim = horizon * ndim (onehot per-step) + cond_dim (weight vector concatenated)
+        self.cond_dim = cond_dim if str(args.method).startswith("mo_") else 0
+        in_dim = args.horizon * args.ndim + self.cond_dim
+        out_dim = 2 * args.ndim + 1
+        if args.augmented:
+            out_dim += 1
+
+        self.model = make_mlp([in_dim] + [args.n_hid] * args.n_layers + [out_dim])
+        self.model.to(args.dev)
+        print(self.model)
+
+        self.augmented = args.augmented
+        if self.augmented:
+            self.intrinsic_reward_model = RND(args.horizon * args.ndim, args.ri_eta)
+            self.intrinsic_reward_model.to(args.dev)
+            self.ri_loss_coe = 1.0
+
+        self.args = args
+        self.replay = ReplayBufferTB(args, envs)
+        # make Z a true parameter so optimizers can update it
+        self.Z = nn.Parameter(torch.zeros(1, device=args.dev))
+
+        # conditional partition function Z(w): small MLP returning scalar logZ
+        if self.cond_dim > 0:
+            self.Z_net = make_mlp([self.cond_dim, args.n_hid, 1])
+            self.Z_net.to(args.dev)
+        else:
+            self.Z_net = None
+
+        self.envs = envs
+        self.ndim = args.ndim
+        self.horizon = args.horizon
+        self.tau = args.bootstrap_tau
+        self.is_star = is_star
+
+        self.exp_weight = args.exp_weight
+        self.temp = args.temp
+        self.uniform_pb = args.rand_pb
+        self.iter_cnt = 0
+        self.dev = args.dev
+
+    def parameters(self):
+        base = chain(self.model.parameters(), self.intrinsic_reward_model.parameters()) if self.augmented else self.model.parameters()
+        # include Z parameter and Z_net (if present)
+        if self.Z_net is not None:
+            return chain(base, [self.Z], self.Z_net.parameters())
+        return chain(base, [self.Z])
+
+    # DEBUG: can remove this as it's just for debugging
+    def z_of_pref(self, pref):
+        """
+        Return logZ(pref) as a numpy scalar or array.
+        Accepts pref as list/array or torch tensor; if pref is None returns scalar Z.
+        """
+        if self.Z_net is None:
+            return float(self.Z.detach().cpu().item())
+        # normalize input to shape (B, cond_dim)
+        if pref is None:
+            pref_t = torch.zeros((1, self.cond_dim), device=self.dev, dtype=torch.float32)
+        else:
+            pref_t = torch.tensor(pref, dtype=torch.float32, device=self.dev)
+            if pref_t.dim() == 1:
+                pref_t = pref_t.unsqueeze(0)
+        with torch.no_grad():
+            out = self.Z_net(pref_t).squeeze(-1).detach().cpu().numpy()
+        return out
+
+    def sample_many(self, mbsize, all_visited, to_print=False):
+        if self.augmented:
+            return self.sample_many_augmented(mbsize, all_visited, to_print)
+        else:
+            return self.sample_many_tb(mbsize, all_visited, to_print)
+
+    def _concat_pref_to_onehot(self, onehot: torch.Tensor, pref):
+        # onehot: (steps, horizon*ndim)
+        if self.cond_dim == 0:
+            return onehot
+        # pref may be None -> use zeros
+        if pref is None:
+            pref_t = torch.zeros((self.cond_dim,), device=onehot.device, dtype=onehot.dtype)
+        else:
+            pref_t = torch.tensor(pref, dtype=onehot.dtype, device=onehot.device)
+        # tile pref for each time step and concat
+        tiled = pref_t.unsqueeze(0).repeat(onehot.shape[0], 1)
+        return torch.cat([onehot, tiled], dim=-1)
+
+    def convert_states_to_onehot(self, states, pref=None):
+        # states: (T, ndim) integer indices
+        try:
+            onehot = torch.nn.functional.one_hot(states, self.horizon).view(states.shape[0], -1).float().to(self.dev)
+        except RuntimeError:
+            print(states)
+            raise
+        return self._concat_pref_to_onehot(onehot, pref)
+
+    def sample_many_tb(self, mbsize, all_visited, to_print=False):
+        # Based on TBFlowNetAgent.sample_many_tb but returns prefs list aligned to episodes
+        self.iter_cnt += 1
+
+        if self.augmented:
+            batch_s = [[] for _ in range(mbsize)]
+            batch_a = [[] for _ in range(mbsize)]
+            batch_next_s = [[] for _ in range(mbsize)]
+            batch_ri = [[] for _ in range(mbsize)]
+        else:
+            batch_s = [[] for _ in range(mbsize)]
+            batch_a = [[] for _ in range(mbsize)]
+
+        env_idx_done_map = {i: False for i in range(mbsize)}
+        not_done_envs = [i for i in range(mbsize)]
+        env_idx_return_map = {}
+
+        s = tf([i.reset()[0] for i in self.envs])[:mbsize, ...]
+        done = [False] * mbsize
+
+        while not all(done):
+            with torch.no_grad():
+                # concat the agent's fixed weight vector (if any) to the per-timestep one-hot inputs
+                pref = getattr(self, "weight_vector", None)
+                model_input = self._concat_pref_to_onehot(s, pref) if self.cond_dim != 0 else s
+                pred = self.model(model_input)
+                # infer z from raw s
+                z = s.reshape(-1, self.ndim, self.horizon).argmax(-1)
+                edge_mask = torch.cat(
+                    [
+                        (z == self.horizon - 1).float(),
+                        torch.zeros((len(done) - sum(done), 1), device=self.args.dev),
+                    ],
+                    1,
+                )
+                logits = (pred[..., : self.ndim + 1] - 1e9 * edge_mask).log_softmax(1)
+
+                sample_ins_probs = (
+                    (1 - self.exp_weight) * (logits / self.temp).softmax(1)
+                    + self.exp_weight
+                    * (1 - edge_mask)
+                    / (1 - edge_mask + 1e-9).sum(1).unsqueeze(1)
+                )
+
+                # sanitize numerics (defensive)
+                sample_ins_probs = torch.nan_to_num(sample_ins_probs, nan=0.0, posinf=0.0, neginf=0.0)
+                valid_mask = (1 - edge_mask)
+                sample_ins_probs = sample_ins_probs * valid_mask
+                row_sums = sample_ins_probs.sum(1, keepdim=True)
+                zero_rows = (row_sums <= 0).squeeze(-1)
+                if zero_rows.any():
+                    denom = valid_mask.sum(1, keepdim=True).float() + 1e-9
+                    uniform = valid_mask / denom
+                    idx = zero_rows.nonzero(as_tuple=False).squeeze(-1)
+                    sample_ins_probs[idx] = uniform[idx]
+                    row_sums = sample_ins_probs.sum(1, keepdim=True)
+                sample_ins_probs = sample_ins_probs / (row_sums + 1e-12)
+
+                acts = sample_ins_probs.multinomial(1).squeeze(-1)
+
+            step = [
+                i.step(a)
+                for i, a in zip([e for d, e in zip(done, self.envs) if not d], acts)
+            ]
+
+            if self.augmented:
+                next_s = tf([i[0] for i in step])
+                intrinsic_rewards = self.intrinsic_reward_model.compute_intrinsic_reward(next_s)
+
+            for dat_idx, (curr_s, curr_a) in enumerate(zip(s, acts)):
+                env_idx = not_done_envs[dat_idx]
+                curr_formatted_s = curr_s.reshape(self.ndim, self.horizon).argmax(-1)
+                batch_s[env_idx].append(curr_formatted_s)
+                batch_a[env_idx].append(curr_a.unsqueeze(-1))
+
+                if self.augmented:
+                    batch_next_s[env_idx].append(next_s[dat_idx])
+                    batch_ri[env_idx].append(intrinsic_rewards[dat_idx])
+
+            for dat_idx, (ns, r, d, _) in enumerate(step):
+                env_idx = not_done_envs[dat_idx]
+                env_idx_done_map[env_idx] = d.item()
+
+                if d.item():
+                    env_idx_return_map[env_idx] = r.item()
+                    formatted_ns = ns.reshape(self.ndim, self.horizon).argmax(-1)
+                    batch_s[env_idx].append(tl(formatted_ns.tolist()))
+
+            not_done_envs = [env_idx for env_idx, env_d in env_idx_done_map.items() if not env_d]
+
+            c = count(0)
+            m = {j: next(c) for j in range(mbsize) if not done[j]}
+            done = [bool(d or step[m[i]][2]) for i, d in enumerate(done)]
+            s = tf([i[0] for i in step if not i[2]])
+
+            for _, r, d, sp in step:
+                if d:
+                    all_visited.append(tuple(sp))
+
+        # finalize per-episode stacks
+        for i in range(len(batch_s)):
+            batch_s[i] = torch.stack(batch_s[i])
+            batch_a[i] = torch.stack(batch_a[i])
+            assert batch_s[i].shape[0] - batch_a[i].shape[0] == 1
+            if self.augmented:
+                batch_next_s[i] = torch.stack(batch_next_s[i])
+                batch_ri[i] = torch.tensor(batch_ri[i]).unsqueeze(-1).float().to(self.dev)
+
+        # collect replayed trajectories (only for star)
+        replay_s, replay_a, replay_R, replay_prefs = [], [], [], []
+        if self.is_star:
+            try:
+                sampled = self.replay.sample()
+                print(sampled)
+            except Exception:
+                sampled = []
+            for entry in sampled:
+                if not entry:
+                    continue
+                if isinstance(entry, (list, tuple)):
+                    if len(entry) >= 5:
+                        r, a, x, pref, producer = entry
+                    elif len(entry) == 4:
+                        r, a, x, pref = entry
+                        producer = None
+                    elif len(entry) == 3:
+                        r, a, x = entry
+                        pref, producer = None, None
+                    else:
+                        continue
+                else:
+                    continue
+                replay_s.append(x)
+                replay_a.append(a)
+                replay_R.append(r)
+                replay_prefs.append(pref)
+
+        # compute returns for fresh rollouts (include intrinsic if augmented)
+        if self.augmented:
+            batch_R = [
+                env_idx_return_map[i] + batch_ri[i][-1].item() if len(batch_ri[i]) else env_idx_return_map.get(i, 0)
+                for i in range(len(batch_s))
+            ]
+        else:
+            batch_R = [env_idx_return_map.get(i, 0) for i in range(len(batch_s))]
+
+        # add fresh rollouts to replay with optional provenance (pref/producer)
+        # also build a prefs list for fresh episodes
+        fresh_prefs = []
+        for s_episode, a_episode, r_episode in zip(batch_s, batch_a, batch_R):
+            producer = "STAR" if self.is_star else "POP"
+            pref = getattr(self, "weight_vector", None)
+            fresh_prefs.append(pref)
+            try:
+                self.replay.add(s_episode, a_episode, r_episode, pref=pref, producer=producer)
+            except TypeError:
+                try:
+                    self.replay.add(s_episode, a_episode, r_episode)
+                except Exception:
+                    pass
+
+        # combined lists
+        prefs = fresh_prefs + replay_prefs
+        return [batch_s + replay_s, batch_a + replay_a, batch_R + replay_R, prefs]
+
+    def learn_from(self, it, batch):
+        if self.augmented:
+            return self.learn_from_augmented(it, batch)
+        else:
+            return self.learn_from_normal(it, batch)
+
+    def learn_from_augmented(self, it, batch):
+        inf = 1000000000
+        # Expecting: states, actions, returns, episode_lens, next_states, intrinsic_rewards, prefs (prefs optional)
+        if len(batch) == 7:
+            states, actions, returns, episode_lens, next_states, intrinsic_rewards, prefs = batch
+        elif len(batch) == 6:
+            states, actions, returns, episode_lens, next_states, intrinsic_rewards = batch
+            prefs = [None] * len(states)
+        else:
+            raise ValueError("Unexpected batch format for ConditionalTBFlowNetAgent.learn_from_augmented")
+
+        returns = torch.tensor(returns).to(self.dev)
+        ll_diff = []
+        for data_idx in range(len(states)):
+            curr_episode_len = episode_lens[data_idx]
+            curr_states = states[data_idx][:curr_episode_len, :]
+            curr_actions = actions[data_idx][:curr_episode_len - 1, :]
+            curr_return = returns[data_idx]
+            curr_pref = prefs[data_idx] if prefs is not None else None
+
+            curr_states_onehot = self.convert_states_to_onehot(curr_states, pref=curr_pref)
+            pred = self.model(curr_states_onehot)
+
+            edge_mask = torch.cat([(curr_states == self.horizon - 1).float(), torch.zeros((curr_states.shape[0], 1), device=self.dev)], 1)
+            logits = (pred[..., :self.ndim + 1] - inf * edge_mask).log_softmax(1)
+
+            init_edge_mask = (curr_states == 0).float()
+            back_logits_end_pos = -1 if self.augmented else pred.shape[-1]
+            back_logits = (pred[..., self.ndim + 1:back_logits_end_pos] - inf * init_edge_mask).log_softmax(1)
+
+            logits = logits[:-1, :].gather(1, curr_actions).squeeze(1)
+            back_logits = back_logits[1:-1, :].gather(1, curr_actions[:-1, :]).squeeze(1) if curr_actions[-1] == self.ndim else back_logits[1:, :].gather(1, curr_actions).squeeze(1)
+
+            sum_logits = torch.sum(logits)
+            if self.augmented:
+                curr_intrinsic_rewards = intrinsic_rewards[data_idx].squeeze(-1)[:-1]
+                flow = (pred[..., -1][1:-1]).exp()
+                augmented_r_f = curr_intrinsic_rewards / flow
+                sum_back_logits = torch.sum((back_logits.exp() + augmented_r_f).log()) if curr_actions[-1] == self.ndim else torch.sum((back_logits[:-1].exp() + augmented_r_f).log()) + back_logits[-1]
+            else:
+                sum_back_logits = torch.sum(back_logits)
+
+            curr_return = curr_return.float().clamp_min(1e-8)
+
+           # conditional Z: use Z_net(pref) if available
+            if self.Z_net is not None:
+                pref_arr = curr_pref if curr_pref is not None else [0.0] * self.cond_dim
+                pref_t = torch.tensor(pref_arr, dtype=curr_states_onehot.dtype, device=self.dev).unsqueeze(0)
+                Z_val = self.Z_net(pref_t).squeeze()
+            else:
+                Z_val = self.Z
+            curr_ll_diff = Z_val + sum_logits - torch.log(curr_return) - sum_back_logits
+            ll_diff.append((curr_ll_diff ** 2).unsqueeze(0))
+
+        if len(ll_diff) == 0:
+            return [torch.tensor(0.0, device=self.dev)]
+        loss = torch.cat(ll_diff).sum() / len(states)
+        if self.augmented:
+            rnd_loss = torch.stack([self.intrinsic_reward_model.compute_loss(next_states[data_idx]) for data_idx in range(len(states))]).sum() / len(states)
+            loss += self.ri_loss_coe * rnd_loss
+
+        return [loss]
+
+    def learn_from_normal(self, it, batch):
+        inf = 1000000000
+        # batch expected: states, actions, returns, prefs (prefs optional)
+        if len(batch) == 4:
+            states, actions, returns, prefs = batch
+        elif len(batch) == 3:
+            states, actions, returns = batch
+            prefs = [None] * len(states)
+        else:
+            raise ValueError("Unexpected batch format for ConditionalTBFlowNetAgent.learn_from_normal")
+
+        returns = torch.tensor(returns).to(self.dev)
+        ll_diff = []
+        for data_idx in range(len(states)):
+            curr_states = states[data_idx]
+            curr_actions = actions[data_idx]
+            curr_return = returns[data_idx]
+            curr_pref = prefs[data_idx] if prefs is not None else None
+
+            curr_states_onehot = self.convert_states_to_onehot(curr_states, pref=curr_pref)
+            pred = self.model(curr_states_onehot)
+
+            edge_mask = torch.cat(
+                [
+                    (curr_states == self.horizon - 1).float(),
+                    torch.zeros((curr_states.shape[0], 1), device=self.dev),
+                ],
+                1,
+            )
+            logits = (pred[..., : self.ndim + 1] - inf * edge_mask).log_softmax(1)
+
+            init_edge_mask = (curr_states == 0).float()
+            back_logits = ((0 if self.uniform_pb else 1) * pred[..., self.ndim + 1 :] - inf * init_edge_mask).log_softmax(-1)
+            logits = logits[:-1, :].gather(1, curr_actions).squeeze(1)
+            back_logits = back_logits[1:-1, :].gather(1, curr_actions[:-1, :]).squeeze(1)
+
+            if self.Z_net is not None:
+                pref_arr = curr_pref if curr_pref is not None else [0.0] * self.cond_dim
+                pref_t = torch.tensor(pref_arr, dtype=curr_states_onehot.dtype, device=self.dev).unsqueeze(0)
+                Z_val = self.Z_net(pref_t).squeeze()
+            else:
+                Z_val = self.Z
+            curr_ll_diff = Z_val + torch.sum(logits) - torch.log(curr_return.float().clamp_min(1e-8)) - torch.sum(back_logits)
+            # make per-episode loss 1-D so torch.cat works (match TBFlowNetAgent)
+            ll_diff.append((curr_ll_diff ** 2).unsqueeze(0))
+
+        loss = torch.cat(ll_diff).sum() / len(states)
+
+        if len(ll_diff) == 0:
+            return [torch.tensor(0.0, device=self.dev)]
+        loss = torch.cat(ll_diff).sum() / len(states)
+        return [loss]
+
 class TBFlowNetAgent:
     def __init__(self, args, envs, is_star=True):
         out_dim = 2 * args.ndim + 1
@@ -699,8 +1303,10 @@ class TBFlowNetAgent:
 
     def sample_many(self, mbsize, all_visited, to_print=False):
         if self.augmented:
+            # variant that computes and returns intrinsic (RND) rewards and extra next-state info for augmented training
             return self.sample_many_augmented(mbsize, all_visited, to_print)
         else:
+            # standard TB (temporal-backward) sampler that also merges replayed episodes (when is_star) and uses the TB loss pipeline
             return self.sample_many_tb(mbsize, all_visited, to_print)
         
     def sample_many_augmented(self, mbsize, all_visited, to_print=False):
@@ -726,6 +1332,7 @@ class TBFlowNetAgent:
 
                 sample_ins_probs = logits.softmax(1)
                 acts = sample_ins_probs.multinomial(1).squeeze(-1)
+                print(acts)
 
             step = [i.step(a) for i, a in zip([e for d, e in zip(done, self.envs) if not d], acts)]
 
@@ -784,10 +1391,10 @@ class TBFlowNetAgent:
 
         batch_R = [env_idx_return_map[i] + batch_ri[i][-1].item() if self.augmented else env_idx_return_map[i] for i in range(len(batch_s))]
 
-
    
         return [batch_s, batch_a, batch_R, batch_steps, batch_next_s, batch_ri]
     
+    '''
     def sample_many_tb(self, mbsize, all_visited, to_print=False):
         self.iter_cnt += 1
         if self.augmented:
@@ -893,6 +1500,165 @@ class TBFlowNetAgent:
             batch_a + replay_a,
             batch_R + replay_R,
         ]  # , np.mean(batch_R) this gives us trajectory
+    '''
+    
+    def sample_many_tb(self, mbsize, all_visited, to_print=False):
+        """
+        TB sampler that collects mbsize trajectories, optionally appends replayed
+        trajectories (when self.is_star), and writes fresh rollouts into the TB replay
+
+        This version is robust to both legacy replay entries (r,a,x) and the
+        extended format (r,a,x,pref,producer). When adding new entries we store
+        optional pref/producer metadata (pref is None in single-objective runs)
+        """
+        self.iter_cnt += 1
+
+        if self.augmented:
+            batch_s = [[] for _ in range(mbsize)]
+            batch_a = [[] for _ in range(mbsize)]
+            batch_next_s = [[] for _ in range(mbsize)]
+            batch_ri = [[] for _ in range(mbsize)]
+        else:
+            batch_s = [[] for _ in range(mbsize)]
+            batch_a = [[] for _ in range(mbsize)]
+
+        env_idx_done_map = {i: False for i in range(mbsize)}
+        not_done_envs = [i for i in range(mbsize)]
+        env_idx_return_map = {}
+
+        s = tf([i.reset()[0] for i in self.envs])[:mbsize, ...]
+        done = [False] * mbsize
+
+        terminals = []
+        while not all(done):
+            with torch.no_grad():
+                pred = self.model(s)
+                z = s.reshape(-1, self.ndim, self.horizon).argmax(-1)
+                # mask unavailable actions
+                edge_mask = torch.cat(
+                    [
+                        (z == self.horizon - 1).float(),
+                        torch.zeros((len(done) - sum(done), 1), device=self.args.dev),
+                    ],
+                    1,
+                )
+                logits = (pred[..., : self.args.ndim + 1] - 1e9 * edge_mask).log_softmax(1)
+
+                sample_ins_probs = (
+                    (1 - self.exp_weight) * (logits / self.temp).softmax(1)
+                    + self.exp_weight
+                    * (1 - edge_mask)
+                    / (1 - edge_mask + 1e-9).sum(1).unsqueeze(1)
+                )
+
+                # print("sample_ins_probs?: ", sample_ins_probs)
+                acts = sample_ins_probs.multinomial(1).squeeze(-1)
+
+            # observation, reward, done, state
+            step = [
+                i.step(a)
+                for i, a in zip([e for d, e in zip(done, self.envs) if not d], acts)
+            ]
+
+            if self.augmented:
+                next_s = tf([i[0] for i in step])
+                intrinsic_rewards = self.intrinsic_reward_model.compute_intrinsic_reward(next_s)
+
+            for dat_idx, (curr_s, curr_a) in enumerate(zip(s, acts)):
+                env_idx = not_done_envs[dat_idx]
+                curr_formatted_s = curr_s.reshape(self.ndim, self.horizon).argmax(-1)
+                batch_s[env_idx].append(curr_formatted_s)  # save this for training
+                batch_a[env_idx].append(curr_a.unsqueeze(-1))
+
+                if self.augmented:
+                    batch_next_s[env_idx].append(next_s[dat_idx])
+                    batch_ri[env_idx].append(intrinsic_rewards[dat_idx])
+
+            for dat_idx, (ns, r, d, _) in enumerate(step):
+                env_idx = not_done_envs[dat_idx]
+                env_idx_done_map[env_idx] = d.item()
+
+                if d.item():
+                    env_idx_return_map[env_idx] = r.item()
+                    formatted_ns = ns.reshape(self.ndim, self.horizon).argmax(-1)
+                    batch_s[env_idx].append(tl(formatted_ns.tolist()))
+
+            not_done_envs = [env_idx for env_idx, env_d in env_idx_done_map.items() if not env_d]
+
+            c = count(0)
+            m = {j: next(c) for j in range(mbsize) if not done[j]}
+            done = [bool(d or step[m[i]][2]) for i, d in enumerate(done)]
+            s = tf([i[0] for i in step if not i[2]])
+
+            for _, r, d, sp in step:
+                if d:
+                    all_visited.append(tuple(sp))
+                    terminals.append(list(sp))
+
+        # finalize per-episode stacks
+        for i in range(len(batch_s)):
+            batch_s[i] = torch.stack(batch_s[i])
+            batch_a[i] = torch.stack(batch_a[i])
+            assert batch_s[i].shape[0] - batch_a[i].shape[0] == 1
+            if self.augmented:
+                batch_next_s[i] = torch.stack(batch_next_s[i])
+                batch_ri[i] = torch.tensor(batch_ri[i]).unsqueeze(-1).float().to(self.dev)
+
+        # collect replayed trajectories (only for star)
+        replay_s, replay_a, replay_R = [], [], []
+        replay_prefs = []
+        if self.is_star:  # only agent star samples from replay
+            try:
+                sampled = self.replay.sample()
+            except Exception:
+                sampled = []
+            for entry in sampled:
+                if not entry:
+                    continue
+                # support legacy (r,a,x) and extended (r,a,x,pref,producer) formats
+                if isinstance(entry, (list, tuple)):
+                    if len(entry) >= 5:
+                        r, a, x, pref, producer = entry
+                    elif len(entry) == 4:
+                        r, a, x, pref = entry
+                        producer = None
+                    elif len(entry) == 3:
+                        r, a, x = entry
+                        pref, producer = None, None
+                    else:
+                        # unexpected format — skip
+                        continue
+                else:
+                    continue
+                replay_s.append(x)
+                replay_a.append(a)
+                replay_R.append(r)
+                replay_prefs.append(pref)
+
+        # compute returns for fresh rollouts (include intrinsic if augmented)
+        if self.augmented:
+            batch_R = [
+                env_idx_return_map[i] + batch_ri[i][-1].item() if len(batch_ri[i]) else env_idx_return_map.get(i, 0)
+                for i in range(len(batch_s))
+            ]
+        else:
+            batch_R = [env_idx_return_map.get(i, 0) for i in range(len(batch_s))]
+
+        # add fresh rollouts to replay with optional provenance (pref/producer)
+        for s_episode, a_episode, r_episode in zip(batch_s, batch_a, batch_R):
+            producer = "STAR" if self.is_star else "POP"
+            pref = getattr(self, "weight_vector", None)
+            try:
+                # ReplayBufferTB.add signature: add(x, a, r_x, pref=None, producer=None)
+                self.replay.add(s_episode, a_episode, r_episode, pref=pref, producer=producer)
+            except TypeError:
+                # fallback to legacy add if present
+                try:
+                    self.replay.add(s_episode, a_episode, r_episode)
+                except Exception:
+                    pass
+
+        return [batch_s + replay_s, batch_a + replay_a, batch_R + replay_R]
 
     def convert_states_to_onehot(self, states):
         # convert to onehot format
@@ -962,6 +1728,7 @@ class TBFlowNetAgent:
         return [loss]
 
     def learn_from_normal(self, it, batch):
+        print("Z: ", self.Z)
         inf = 1000000000
         states, actions, returns = batch
         returns = torch.tensor(returns).to(self.dev)
@@ -1861,6 +2628,194 @@ def seed_torch(seed, verbose=True):
     if verbose:
         print("==> Set seed to {:}".format(seed))
 
+# added (prior to main)
+
+def reward_stratified_redundancy(all_visited, data, env, window=500):
+    """
+    Separates redundancy in high-reward vs low-reward regions.
+    The interesting question: is the population finding high-reward
+    states the star agent already knows, or genuinely new ones?
+    """
+    if len(all_visited) < 50:
+        return 0.0, 0.0, 0
+    
+    recent = all_visited[-window:]
+    
+    # Separate recent visits into high and low reward
+    high_reward_known = set()
+    low_reward_known = set()
+    
+    for s in recent:
+        s_arr = np.int32(list(s))
+        x = env.s2x(s_arr)
+        r = env.func(x)
+        s_norm = tuple(int(v) for v in s)
+        if r > 1.0:  # high reward threshold
+            high_reward_known.add(s_norm)
+        else:
+            low_reward_known.add(s_norm)
+    
+    # Check population terminals
+    try:
+        states_list = data[0]
+        terminals = [
+            tuple(int(x) for x in states[-1]) 
+            for states in states_list
+        ]
+    except (IndexError, TypeError):
+        return 0.0, 0.0, 0
+    
+    if not terminals:
+        return 0.0, 0.0, 0
+    
+    redundant_high = sum(1 for t in terminals if t in high_reward_known)
+    redundant_low = sum(1 for t in terminals if t in low_reward_known)
+    n = len(terminals)
+    
+    return redundant_high / n, redundant_low / n, n
+
+def simple_redundancy_check(all_visited, data, window=500):
+    if len(all_visited) < 50:
+        return 0.0, 0  # ← add the 0 here
+    
+    recent_star = set(
+        tuple(int(x) for x in s)
+        for s in all_visited[-window:]
+    )
+    
+    current_terminals = []
+    try:
+        states_list = data[0]
+        for states in states_list:
+            terminal = tuple(int(x) for x in states[-1])
+            current_terminals.append(terminal)
+    except (IndexError, TypeError):
+        return 0.0, 0
+    
+    if not current_terminals:
+        return 0.0, 0
+    
+    redundant = sum(
+        1 for t in current_terminals
+        if t in recent_star
+    )
+    
+    return redundant / len(current_terminals), len(current_terminals)
+
+
+# ADDED METRICS FOR MO ------------
+def visited_terminal_objectives(data, env):
+    """
+    Extract objective vectors (e.g., [f1,f2]) for terminal states from a
+    sampled `data` batch. Be robust to legacy and extended data formats.
+    Returns an (N, D) numpy array of objective vectors, or empty array.
+    """
+    objs = []
+    try:
+        # data is typically a list where first element is a list of state sequences
+        states_list = data[0]
+    except Exception:
+        return np.zeros((0, 2))
+
+    for states in states_list:
+        try:
+            term = states[-1]
+            x = env.s2x(np.int32(list(term)))
+            f = env.mo_reward(x)
+            objs.append(np.array(f, dtype=float))
+        except Exception:
+            continue
+
+    if not len(objs):
+        return np.zeros((0, 2))
+    return np.vstack(objs)
+
+
+def pareto_coverage(data, env):
+    """
+    Fraction of true Pareto terminal states that were hit by the provided
+    `data` sample (based on exact terminal-state equality).
+    """
+    try:
+        # get visited terminal states from data
+        states_list = data[0]
+    except Exception:
+        return 0.0
+
+    visited = {tuple(int(x) for x in s[-1]) for s in states_list if len(s)}
+    pareto = set(env.pareto_modes())
+    if not pareto:
+        return 0.0
+    covered = sum(1 for p in pareto if p in visited)
+    return covered / len(pareto)
+
+
+def igd(approx_objs, env):
+    """
+    Inverted Generational Distance (IGD): average distance from each true
+    Pareto point to the nearest point in the approximated front.
+    """
+    try:
+        pareto_states = env.pareto_modes()
+        if len(pareto_states) == 0:
+            return float("nan")
+        true_pts = np.vstack([env.mo_reward(env.s2x(np.int32(list(s)))) for s in pareto_states])
+        if approx_objs.shape[0] == 0:
+            return float("inf")
+        dists = []
+        for t in true_pts:
+            dists.append(np.min(np.linalg.norm(approx_objs - t, axis=1)))
+        return float(np.mean(dists))
+    except Exception:
+        return float("nan")
+
+
+def per_weight_performance(data, env, weights=None):
+    """
+    Compute max scalarized reward found in `data` for each weight vector.
+    Returns a list of (w, max_value).
+    """
+    if weights is None:
+        weights = [np.array([1.0, 0.0]), np.array([0.0, 1.0]), np.array([0.5, 0.5])]
+    try:
+        states_list = data[0]
+    except Exception:
+        return [(w, 0.0) for w in weights]
+
+    results = []
+    term_objs = []
+    for s in states_list:
+        if not len(s):
+            continue
+        x = env.s2x(np.int32(list(s[-1])))
+        term_objs.append(env.mo_reward(x))
+    if not term_objs:
+        return [(w, 0.0) for w in weights]
+    term_objs = np.vstack(term_objs)
+
+    for w in weights:
+        vals = [env.scalarize(env.s2x(np.int32(list(s[-1]))), w) for s in states_list if len(s)]
+        vals = [v for v in vals if not (v is None)]
+        if not vals:
+            results.append((w, 0.0))
+        else:
+            results.append((w, float(np.max(vals))))
+    return results
+
+
+def simple_spacing_metric(approx_objs):
+    """
+    A simple spacing-like metric: compute nearest-neighbour distances and
+    return mean and std (as a tuple). If insufficient points, return (nan,nan).
+    """
+    if approx_objs.shape[0] < 2:
+        return (float("nan"), float("nan"))
+    dists = []
+    for i in range(approx_objs.shape[0]):
+        others = np.vstack([approx_objs[j] for j in range(approx_objs.shape[0]) if j != i])
+        dists.append(np.min(np.linalg.norm(others - approx_objs[i], axis=1)))
+    return (float(np.mean(dists)), float(np.std(dists)))
+# ENDING ADDED METRICS FOR MO --------
 
 def main(args):
     torch.set_num_threads(1)
@@ -1880,12 +2835,19 @@ def main(args):
     args.is_mcmc = args.method in ["mars", "mcmc"]
 
     f = get_func(args)
-    env = GridEnv(args.horizon, args.ndim, func=f, allow_backward=args.is_mcmc)
-    envs = [
-        GridEnv(args.horizon, args.ndim, func=f, allow_backward=args.is_mcmc)
-        for _ in range(args.mbsize)
-    ]
-
+    # use MOGridEnv for multi-objective methods (prefix 'mo_'), otherwise GridEnv
+    if str(args.method).startswith("mo_"):
+        env = MOGridEnv(args.horizon, args.ndim, func=f, allow_backward=args.is_mcmc, R0=args.R0, R1=args.R1, R2=args.R2)
+        envs = [
+            MOGridEnv(args.horizon, args.ndim, func=f, allow_backward=args.is_mcmc, R0=args.R0, R1=args.R1, R2=args.R2)
+            for _ in range(args.mbsize)
+        ]
+    else:
+        env = GridEnv(args.horizon, args.ndim, func=f, allow_backward=args.is_mcmc)
+        envs = [
+            GridEnv(args.horizon, args.ndim, func=f, allow_backward=args.is_mcmc)
+            for _ in range(args.mbsize)
+        ]
 
     # GFN methods
     if args.method in ["fm"]:
@@ -1896,9 +2858,12 @@ def main(args):
         agent = DBFlowNetAgent(args, envs)
     elif args.method in ["fm_egfn", "tb_egfn", "db_egfn"]:
         from egfn import EvolutionGFNAgent
-
         evo_agent = EvolutionGFNAgent(args, envs)
         agent = evo_agent.agent_star
+    elif args.method in ["mo_tb_egfn"]:
+        from egfn import MOEvolutionGFNAgent
+        mo_evo_agent = MOEvolutionGFNAgent(args, envs)
+        agent = mo_evo_agent.agent_star
     elif args.method in ["qm"]:
         from distributional import DistFlowNetAgentIQN
 
@@ -1951,6 +2916,11 @@ def main(args):
     replay_dict = {}
     sample_dict = {}
     all_fitness = {}
+    # added
+    redundancy_dict = {}    # redundancy rate at each eval step
+    wasted_compute_dict = {}  # absolute number of redundant trajectories
+    low_redundancy_dict = {}
+    # end of added
     fitness = 0
     if args.func == "corner":
         last_idx = 0
@@ -1973,11 +2943,21 @@ def main(args):
         ttsr = args.ppo_num_epochs
         sttr = args.ppo_epoch_size
 
-    
     start_time = time.time()
     for i in tqdm(range(args.n_train_steps + 1), disable=not args.progress):
         if args.method in ["fm_egfn", "tb_egfn", "db_egfn"]:
             fitness = evo_agent.evolve()
+        elif args.method == "mo_tb_egfn":
+            fitness = mo_evo_agent.evolve()
+            
+            # DEBUG: show logZ(pref) and Z(pref) for some example preferences (only when conditional)
+            '''
+            if getattr(agent, "cond_dim", 0) > 0 and getattr(agent, "Z_net", None) is not None:
+                prefs_to_check = [[1.0, 0.0], [0.0, 1.0], [0.5, 0.5]]
+                for p in prefs_to_check:
+                    z_val = agent.z_of_pref(p)  # logZ
+                    print(f"pref={p} -> logZ={z_val}, Z={np.exp(z_val)}")
+            '''
         data = []
         for j in range(sttr):
             data += agent.sample_many(args.mbsize, all_visited)
@@ -1991,6 +2971,32 @@ def main(args):
                     if args.method in ['iql']:
                        continue 
                     losses[0].backward()
+
+
+                    # --- DEBUG: inspect Z_net / Z numeric outputs and grads ---
+                    '''
+                    if getattr(agent, "Z_net", None) is not None:
+                        # sample a canonical pref vector to inspect Z_net(pref)
+                        sample_pref = torch.tensor([[1.0 / agent.cond_dim] * agent.cond_dim], device=args.dev, dtype=torch.float32)
+                        try:
+                            z_out = agent.Z_net(sample_pref).detach().cpu().numpy()
+                            print("Z_net(sample_pref) ->", z_out)
+                        except Exception as e:
+                            print("Z_net eval failed:", e)
+                        # print param & grad norms
+                        try:
+                            print("Z param norm:", float(getattr(agent, "Z").detach().norm()), "grad:",
+                                  None if getattr(agent, "Z").grad is None else float(agent.Z.grad.detach().norm()))
+                        except Exception:
+                            pass
+                        for idx, p in enumerate(agent.Z_net.parameters()):
+                            print(f"Z_net param {idx} norm:", float(p.detach().norm()), "grad:",
+                                  None if p.grad is None else float(p.grad.detach().norm()))
+                    else:
+                        print("Z scalar:", getattr(agent, "Z"))
+                    '''
+
+
                     if args.clip_grad_norm > 0:
                         torch.nn.utils.clip_grad_norm_(
                             agent.parameters(), args.clip_grad_norm
@@ -2002,10 +3008,72 @@ def main(args):
 
         eval_every = 100
         if i % eval_every == 0 or i == args.n_train_steps:
-            l1, kl = compute_empirical_distribution_error(
-                env, all_visited[-args.num_empirical_loss :]
+
+            if args.method in ["fm_egfn", "tb_egfn", "db_egfn", "db_gfn", "mo_tb_egfn"]:
+                redundant_high, redundant_low, total_terminals = \
+                    reward_stratified_redundancy(all_visited, data, env, window=500)
+                
+                redundancy_dict[i] = redundant_high
+                wasted_compute_dict[i] = redundant_high * total_terminals
+                low_redundancy_dict[i] = redundant_low
+                
+                if args.progress:
+                    print(
+                        f"Step {i}: "
+                        f"High-reward redundancy={redundant_high:.3f}, "
+                        f"Low-reward redundancy={redundant_low:.3f}, "
+                        f"Total terminals={total_terminals}"
+                    )
+
+            l1, kl = compute_empirical_distribution_error(  # ← this line was removed
+                env, all_visited[-args.num_empirical_loss:]
             )
             empirical_distrib_losses.append((l1, kl))
+        
+            # MO-specific metrics (compute and log when running multi-objective methods)
+            if str(args.method).startswith("mo_"):
+                try:
+                    approx_objs = visited_terminal_objectives(data, env)
+                    # fast approximate pareto fraction: fraction of visited terminals that are non-dominated
+                    if approx_objs.shape[0] == 0:
+                        approx_pcov = 0.0
+                        spacing_mean, spacing_std = (float("nan"), float("nan"))
+                    else:
+                        # 2-objective fast nondominated filter: sort by f1 desc, keep increasing f2
+                        idx = np.argsort(-approx_objs[:, 0], kind="mergesort")
+                        max_f2 = -np.inf
+                        nd_count = 0
+                        for k in idx:
+                            f2 = approx_objs[k, 1]
+                            if f2 > max_f2:
+                                nd_count += 1
+                                max_f2 = f2
+                        approx_pcov = nd_count / float(approx_objs.shape[0])
+                        spacing_mean, spacing_std = simple_spacing_metric(approx_objs)
+
+                    pw = per_weight_performance(data, env)
+
+                    print(
+                        f"MO quick metrics: approx_pareto_fraction={approx_pcov:.3f}, "
+                        f"spacing_mean={spacing_mean:.4e}, spacing_std={spacing_std:.4e}"
+                    )
+                    print("MO per-weight perf (found maxima):", ", ".join([f"{w.tolist()}->{v:.4f}" for w, v in pw]))
+
+                    if args.wandb:
+                        wandb.log({
+                            "MO/approx_pareto_fraction": approx_pcov,
+                            "MO/spacing_mean": spacing_mean,
+                            "MO/spacing_std": spacing_std,
+                        }, step=i)
+                        for idx, (w, v) in enumerate(pw):
+                            wandb.log({f"MO/perf_w{idx}": v}, step=i)
+                except Exception as e:
+                    print("MO metrics calc failed (quick metrics):", e)
+                # ENDING MO-specfic metrics (quick)
+
+
+
+
 
             if args.progress:
                 recent = min(len(all_visited), args.num_empirical_loss)  # 1000
@@ -2020,9 +3088,7 @@ def main(args):
                     pbar = range(eval_every)
                     for _ in pbar:
                         agent.sample_many(args.mbsize, all_visited_eval, eval=True)
-                    l1, kl = compute_empirical_distribution_error(
-                        env, all_visited_eval[-args.num_empirical_loss :]
-                    )
+                    l1, kl = compute_empirical_distribution_error(env, all_visited[-args.num_empirical_loss:])
                 else:
                     l1, kl = empirical_distrib_losses[-1]
 
@@ -2092,6 +3158,9 @@ def main(args):
                 "replay_dict": replay_dict,
                 "sample_dict": sample_dict,
                 "fitness_dict": all_fitness,
+                "redundancy_dict": redundancy_dict,
+                "wasted_compute_dict": wasted_compute_dict,
+                "low_redundancy_dict": low_redundancy_dict, 
             }
             pickle.dump(save_dict, gzip.open("./result.json", "wb"))
 
